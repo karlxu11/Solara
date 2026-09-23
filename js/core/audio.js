@@ -2,7 +2,7 @@
  * Solara 核心音频引擎与播放管线 (HTML5 Audio, 播放模式, 进度/音量同步, 自动切歌)
  */
 
-import { API } from "../constants.js";
+import { API, SOURCE_OPTIONS } from "../constants.js";
 import { safeSetLocalStorage, preferHttpsUrl, buildAudioProxyUrl } from "./storage.js";
 import { showNotification } from "../features/settings.js";
 import { getSongKey } from "../features/playlist.js";
@@ -17,6 +17,98 @@ export const playModeTexts = {
 // 短期音频地址内存缓存（15分钟 TTL），避免用户在播放列表内切歌反复请求 types=url
 const audioUrlMemoryCache = new Map();
 const AUDIO_URL_CACHE_TTL = 15 * 60 * 1000;
+
+function normalizeTrackText(value) {
+    return String(value || "")
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .replace(/[\s\p{P}\p{S}]/gu, "");
+}
+
+function getArtistNames(song) {
+    const value = song?.artist ?? song?.artists ?? song?.singers ?? song?.singer;
+    if (Array.isArray(value)) {
+        return value.map((artist) => {
+            if (typeof artist === "string") return artist;
+            if (artist && typeof artist.name === "string") return artist.name;
+            return "";
+        }).filter(Boolean);
+    }
+    if (typeof value === "string") {
+        return value.split(/[、,/，&＆]+/).map((artist) => artist.trim()).filter(Boolean);
+    }
+    if (value && typeof value.name === "string") return [value.name];
+    return [];
+}
+
+function textSimilarity(left, right) {
+    const a = Array.from(normalizeTrackText(left));
+    const b = Array.from(normalizeTrackText(right));
+    if (a.length === 0 || b.length === 0) return 0;
+    if (a.join("") === b.join("")) return 1;
+
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let row = 1; row <= a.length; row++) {
+        const current = [row];
+        for (let column = 1; column <= b.length; column++) {
+            const substitutionCost = a[row - 1] === b[column - 1] ? 0 : 1;
+            current[column] = Math.min(
+                current[column - 1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + substitutionCost
+            );
+        }
+        previous = current;
+    }
+    return 1 - previous[b.length] / Math.max(a.length, b.length);
+}
+
+function getTrackMatchScore(originalSong, candidate) {
+    const titleSimilarity = textSimilarity(originalSong?.name, candidate?.name);
+    const originalArtists = getArtistNames(originalSong);
+    const candidateArtists = getArtistNames(candidate);
+    const artistSimilarity = Math.max(0, ...originalArtists.flatMap((originalArtist) =>
+        candidateArtists.map((candidateArtist) => {
+            const originalText = normalizeTrackText(originalArtist);
+            const candidateText = normalizeTrackText(candidateArtist);
+            if (!originalText || !candidateText) return 0;
+            if (originalText.includes(candidateText) || candidateText.includes(originalText)) return 1;
+            return textSimilarity(originalArtist, candidateArtist);
+        })
+    ));
+
+    // 两项都要相似，避免同名异曲被自动播放。
+    if (titleSimilarity < 0.8 || artistSimilarity < 0.45) return null;
+    return titleSimilarity * 0.7 + artistSimilarity * 0.3;
+}
+
+async function findAlternativeSong(song, attemptedSources, log) {
+    const artist = getArtistNames(song)[0];
+    const keyword = [song?.name, artist].filter(Boolean).join(" ").trim();
+    if (!keyword) return null;
+
+    for (const sourceOption of SOURCE_OPTIONS) {
+        if (attemptedSources.has(sourceOption.value)) continue;
+        attemptedSources.add(sourceOption.value);
+
+        try {
+            log(`[音源切换] 正在${sourceOption.label}搜索匹配曲目...`);
+            const results = await API.search(keyword, sourceOption.value, 20, 1, log);
+            const bestMatch = results
+                .map((candidate) => ({ candidate, score: getTrackMatchScore(song, candidate) }))
+                .filter((match) => match.score !== null)
+                .sort((left, right) => right.score - left.score)[0];
+
+            if (bestMatch) {
+                return bestMatch.candidate;
+            }
+            log(`[音源切换] ${sourceOption.label}没有找到足够匹配的曲目`);
+        } catch (error) {
+            log(`[音源切换] ${sourceOption.label}搜索失败: ${error?.message || error}`);
+        }
+    }
+    return null;
+}
 
 export const APPLE_SVG_ICONS = {
     play: `<svg class="apple-svg-icon icon-play" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 5.5v13a1.5 1.5 0 0 0 2.3 1.28l10.5-6.5a1.5 1.5 0 0 0 0-2.56L9.3 4.22A1.5 1.5 0 0 0 7 5.5z"/></svg>`,
@@ -271,7 +363,7 @@ export function cancelPendingPlayback() {
 }
 
 export async function playSong(song, options = {}, state, dom, callbacks = {}, debugLogger = null) {
-    const myToken = ++currentPlaybackToken;
+    const myToken = options.playbackToken || ++currentPlaybackToken;
     const { autoplay = true, startTime = 0, preserveProgress = false, isRetry = false } = options;
 
     state.audioReadyForPalette = false;
@@ -407,23 +499,20 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
         if (autoplay) {
             playPromise = dom.audioPlayer.play();
             if (playPromise !== undefined) {
-                playPromise.catch(async error => {
-                    console.error('播放失败:', error);
-                    log(`[音频异常] 播放失败: ${error?.message || error}`);
-                    if (!isRetry) {
-                        try {
-                            await playSong(song, { ...options, isRetry: true }, state, dom, callbacks, debugLogger);
-                        } catch (retryError) {
-                            showNotification('播放失败，请检查网络连接', 'error', dom);
-                        }
-                    } else {
-                        showNotification('播放失败，请检查网络连接', 'error', dom);
-                    }
-                });
+                try {
+                    await playPromise;
+                } catch (error) {
+                    if (myToken !== currentPlaybackToken) return;
+                    throw error;
+                }
             }
         } else {
             dom.audioPlayer.pause();
             updatePlayPauseButton(dom);
+        }
+
+        if (myToken !== currentPlaybackToken) {
+            return;
         }
 
         // 异步延迟调度封面、歌词与极光色彩应用
@@ -436,10 +525,85 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
         }
     } catch (error) {
         console.error('播放歌曲失败:', error);
-        if (!isRetry) {
-            return playSong(song, { ...options, isRetry: true }, state, dom, callbacks, debugLogger);
+        if (myToken !== currentPlaybackToken) {
+            return;
         }
-        throw error;
+        if (error?.name === 'NotAllowedError') {
+            throw error;
+        }
+        if (!isRetry) {
+            return playSong(song, { ...options, isRetry: true, playbackToken: myToken }, state, dom, callbacks, debugLogger);
+        }
+
+        const fallbackContext = options.fallbackContext || {
+            originalSong: song,
+            attemptedSources: new Set([song.source || 'netease']),
+            notified: false,
+            resolved: false,
+        };
+        fallbackContext.attemptedSources.add(song.source || 'netease');
+
+        if (!fallbackContext.notified) {
+            fallbackContext.notified = true;
+            log(`[音源切换] ${fallbackContext.originalSong.name || '当前歌曲'}原音源连续播放失败，开始搜索其他音源`);
+            showNotification('当前音源播放失败，正在尝试其他音源…', 'info', dom);
+        }
+
+        const alternativeSong = await findAlternativeSong(
+            fallbackContext.originalSong,
+            fallbackContext.attemptedSources,
+            log
+        );
+        if (myToken !== currentPlaybackToken) {
+            return;
+        }
+        if (!alternativeSong) {
+            log('[音源切换] 没有找到可播放的匹配曲目');
+            state.currentSong = fallbackContext.originalSong;
+            state.currentAudioUrl = null;
+            if (typeof callbacks.updateCurrentSongInfo === 'function') {
+                callbacks.updateCurrentSongInfo(fallbackContext.originalSong, { loadArtwork: false });
+            }
+            throw error;
+        }
+
+        log(`[音源切换] 尝试使用${SOURCE_OPTIONS.find((option) => option.value === alternativeSong.source)?.label || alternativeSong.source}播放`);
+        await playSong(alternativeSong, {
+            ...options,
+            isRetry: false,
+            playbackToken: myToken,
+            fallbackContext,
+        }, state, dom, callbacks, debugLogger);
+
+        if (myToken !== currentPlaybackToken) {
+            return;
+        }
+
+        if (!fallbackContext.resolved) {
+            const resolvedSong = state.currentSong && state.currentSong !== fallbackContext.originalSong
+                ? state.currentSong
+                : alternativeSong;
+            Object.assign(fallbackContext.originalSong, resolvedSong);
+            state.currentSong = fallbackContext.originalSong;
+            fallbackContext.resolved = true;
+
+            if (typeof callbacks.updateCurrentSongInfo === 'function') {
+                callbacks.updateCurrentSongInfo(fallbackContext.originalSong, { loadArtwork: false });
+            }
+            if (typeof callbacks.scheduleDeferredSongAssets === 'function') {
+                callbacks.scheduleDeferredSongAssets(fallbackContext.originalSong, Promise.resolve());
+            }
+            if (typeof callbacks.savePlayerState === 'function') {
+                callbacks.savePlayerState();
+            }
+            if (state.currentList === 'favorite' && typeof callbacks.saveFavoriteState === 'function') {
+                callbacks.saveFavoriteState();
+            }
+
+            const resolvedSource = SOURCE_OPTIONS.find((option) => option.value === fallbackContext.originalSong.source);
+            showNotification(`已切换到${resolvedSource?.label || fallbackContext.originalSong.source}音源`, 'success', dom);
+            log(`[音源切换] 已切换到${resolvedSource?.label || fallbackContext.originalSong.source}`);
+        }
     } finally {
         if (typeof callbacks.savePlayerState === "function") {
             callbacks.savePlayerState();
@@ -701,4 +865,3 @@ export function resetPlayerToIdle(state, dom, callbacks = {}) {
         callbacks.savePlayerState();
     }
 }
-
